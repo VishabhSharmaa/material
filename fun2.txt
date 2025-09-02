@@ -1,0 +1,391 @@
+WITH Meeting_Prep AS (
+    SELECT
+        customer_number,
+        agent_type_2,
+        meeting_type,
+        appointment_date
+    FROM DS_UKP_WPB_DNA_F_HEALTH_PROD.RMP_appointments
+    WHERE Agent_Type_2 NOT IN ('Specialist Team Manager', 'AWM')
+      AND Appointment_Status_Code IN ('Completed', 'Open')
+      AND Appointment_Date <= DATE '2025-05-22'
+      AND meeting_type IN (
+            '01 Individual review',
+            '04 Annual review',
+            '05 Ongoing advice Annual Review',
+            '02 Discovery meeting',
+            '03 Recommendation meeting'
+      )
+),
+Meeting_Timeline AS (
+    SELECT
+        customer_number,
+        agent_type_2,
+        meeting_type,
+        appointment_date,
+        ROW_NUMBER() OVER (PARTITION BY customer_number ORDER BY appointment_date) as meeting_sequence,
+        LAG(appointment_date) OVER (PARTITION BY customer_number ORDER BY appointment_date) as prev_meeting_date,
+        LAG(meeting_type) OVER (PARTITION BY customer_number ORDER BY appointment_date) as prev_meeting_type
+    FROM Meeting_Prep
+),
+-- Separate recommendation meetings for priority processing
+Recommendation_Meetings AS (
+    SELECT
+        customer_number,
+        agent_type_2,
+        appointment_date,
+        ROW_NUMBER() OVER (PARTITION BY customer_number ORDER BY appointment_date) as rec_sequence
+    FROM Meeting_Prep
+    WHERE meeting_type = '03 Recommendation meeting'
+),
+-- Get customer first meeting date for priority rule
+Customer_First_Meeting AS (
+    SELECT
+        customer_number,
+        MIN(appointment_date) AS first_meeting_date
+    FROM Meeting_Prep
+    WHERE meeting_type IN ('01 Individual review', '04 Annual review', '05 Ongoing advice Annual Review')
+    GROUP BY customer_number
+),
+-- Create journey breakpoints for non-recommendation meetings
+Journey_Breakpoints_Base AS (
+    SELECT
+        customer_number,
+        agent_type_2,
+        meeting_type,
+        appointment_date,
+        meeting_sequence,
+        prev_meeting_date,
+        prev_meeting_type,
+        CASE 
+            WHEN meeting_sequence = 1 THEN 1  -- First meeting always starts journey 1
+            WHEN prev_meeting_date IS NULL THEN 1
+            -- Journey break: gap > 3 months between review/discovery meetings
+            WHEN meeting_type IN ('01 Individual review', '04 Annual review', '05 Ongoing advice Annual Review', '02 Discovery meeting')
+                 AND prev_meeting_type IN ('01 Individual review', '04 Annual review', '05 Ongoing advice Annual Review', '02 Discovery meeting')
+                 AND DATE_DIFF(appointment_date, prev_meeting_date, DAY) > 90 THEN 1
+            ELSE 0  -- Continue current journey
+        END as is_journey_start
+    FROM Meeting_Timeline
+    WHERE meeting_type != '03 Recommendation meeting'  -- Exclude recommendations for now
+),
+Journey_Numbers_Base AS (
+    SELECT
+        customer_number,
+        agent_type_2,
+        meeting_type,
+        appointment_date,
+        meeting_sequence,
+        is_journey_start,
+        SUM(is_journey_start) OVER (
+            PARTITION BY customer_number 
+            ORDER BY appointment_date 
+            ROWS UNBOUNDED PRECEDING
+        ) as journey_number
+    FROM Journey_Breakpoints_Base
+),
+-- Get journey boundaries
+Journey_Boundaries AS (
+    SELECT
+        customer_number,
+        journey_number,
+        MIN(appointment_date) AS journey_start_date,
+        MAX(appointment_date) AS journey_end_date
+    FROM Journey_Numbers_Base
+    GROUP BY customer_number, journey_number
+),
+-- Identify discovery meetings per journey
+Discovery_Journey_Info AS (
+    SELECT 
+        customer_number,
+        journey_number,
+        MIN(CASE WHEN meeting_type = '02 Discovery meeting' THEN appointment_date END) as discovery_date
+    FROM Journey_Numbers_Base
+    GROUP BY customer_number, journey_number
+    HAVING MIN(CASE WHEN meeting_type = '02 Discovery meeting' THEN appointment_date END) IS NOT NULL
+),
+-- Priority assignment for recommendations
+Recommendation_Assignment AS (
+    SELECT
+        rm.customer_number,
+        rm.agent_type_2,
+        rm.appointment_date,
+        rm.rec_sequence,
+        cfm.first_meeting_date,
+        -- Priority assignment logic    
+        CASE 
+            -- Rule 1: Within 9 months of first meeting -> Journey 1 (highest priority)
+            WHEN rm.appointment_date BETWEEN cfm.first_meeting_date 
+                AND DATE_ADD(cfm.first_meeting_date, INTERVAL 9 MONTH) THEN 1
+            -- Rule 2: Find the latest journey that this recommendation can validly join
+            ELSE (
+                SELECT MAX(jb.journey_number)
+                FROM Journey_Boundaries jb
+                LEFT JOIN Discovery_Journey_Info dji 
+                    ON jb.customer_number = dji.customer_number 
+                    AND jb.journey_number = dji.journey_number
+                WHERE jb.customer_number = rm.customer_number
+                  AND rm.appointment_date >= jb.journey_start_date
+                  AND (
+                    -- Has discovery: within 6 months of discovery
+                    (dji.discovery_date IS NOT NULL 
+                     AND rm.appointment_date BETWEEN dji.discovery_date 
+                     AND DATE_ADD(dji.discovery_date, INTERVAL 6 MONTH))
+                    OR
+                    -- No discovery: within 3 months of journey start
+                    (dji.discovery_date IS NULL 
+                     AND rm.appointment_date BETWEEN jb.journey_start_date 
+                     AND DATE_ADD(jb.journey_start_date, INTERVAL 3 MONTH))
+                  )
+            )
+        END as assigned_journey_number,
+        -- Mark if this creates a new journey (when no valid existing journey found)
+        CASE 
+            WHEN rm.appointment_date BETWEEN cfm.first_meeting_date 
+                AND DATE_ADD(cfm.first_meeting_date, INTERVAL 9 MONTH) THEN 0
+            WHEN NOT EXISTS (
+                SELECT 1
+                FROM Journey_Boundaries jb
+                LEFT JOIN Discovery_Journey_Info dji 
+                    ON jb.customer_number = dji.customer_number 
+                    AND jb.journey_number = dji.journey_number
+                WHERE jb.customer_number = rm.customer_number
+                  AND rm.appointment_date >= jb.journey_start_date
+                  AND (
+                    (dji.discovery_date IS NOT NULL 
+                     AND rm.appointment_date BETWEEN dji.discovery_date 
+                     AND DATE_ADD(dji.discovery_date, INTERVAL 6 MONTH))
+                    OR
+                    (dji.discovery_date IS NULL 
+                     AND rm.appointment_date BETWEEN jb.journey_start_date 
+                     AND DATE_ADD(jb.journey_start_date, INTERVAL 3 MONTH))
+                  )
+            ) THEN 1
+            ELSE 0
+        END as creates_new_journey
+    FROM Recommendation_Meetings rm
+    JOIN Customer_First_Meeting cfm ON rm.customer_number = cfm.customer_number
+),
+-- Handle new journeys created by recommendations
+Max_Journey_Numbers AS (
+    SELECT 
+        customer_number,
+        COALESCE(MAX(journey_number), 0) as max_existing_journey
+    FROM Journey_Numbers_Base
+    GROUP BY customer_number
+),
+-- Final recommendation assignments with new journey numbers
+Final_Recommendation_Assignment AS (
+    SELECT
+        ra.customer_number,
+        ra.agent_type_2,
+        ra.appointment_date,
+        ra.rec_sequence,
+        CASE 
+            WHEN ra.creates_new_journey = 1 THEN 
+                mjn.max_existing_journey + ROW_NUMBER() OVER (
+                    PARTITION BY ra.customer_number, ra.creates_new_journey 
+                    ORDER BY ra.appointment_date
+                )
+            ELSE ra.assigned_journey_number
+        END as final_journey_number
+    FROM Recommendation_Assignment ra
+    JOIN Max_Journey_Numbers mjn ON ra.customer_number = mjn.customer_number
+),
+-- Combine all meetings with their journey assignments
+All_Meetings_With_Journeys AS (
+    -- Base meetings (non-recommendations)
+    SELECT
+        customer_number,
+        agent_type_2,
+        meeting_type,
+        appointment_date,
+        journey_number
+    FROM Journey_Numbers_Base
+    
+    UNION ALL
+    
+    -- Assigned recommendations
+    SELECT
+        customer_number,
+        agent_type_2,
+        '03 Recommendation meeting' as meeting_type,
+        appointment_date,
+        final_journey_number as journey_number
+    FROM Final_Recommendation_Assignment
+    WHERE final_journey_number IS NOT NULL
+),
+-- Valid recommendations for fee matching
+Valid_Rec_Meetings_Journey AS (
+    SELECT DISTINCT
+        customer_number,
+        journey_number,
+        appointment_date AS rec_date,
+        agent_type_2
+    FROM Final_Recommendation_Assignment
+    WHERE final_journey_number IS NOT NULL
+),
+-- Journey-level aggregations
+Journey_Aggregates AS (
+    SELECT
+        amwj.customer_number AS CIN,
+        amwj.journey_number,
+        -- Individual Review Metrics (Non-Advisory)
+        MIN(CASE WHEN meeting_type = '01 Individual review' AND agent_type_2 NOT IN ('WA', 'WM', 'WM HNW', 'WM HNW PB')
+            THEN appointment_date END) AS FIRST_IND_RV,
+        MAX(CASE WHEN meeting_type = '01 Individual review' AND agent_type_2 NOT IN ('WA', 'WM', 'WM HNW', 'WM HNW PB')
+            THEN appointment_date END) AS LAST_IND_RV,
+        COUNT(CASE WHEN meeting_type = '01 Individual review' AND agent_type_2 NOT IN ('WA', 'WM', 'WM HNW', 'WM HNW PB')
+            THEN 1 END) AS NO_OF_IND_RV,
+        
+        -- Individual Review Metrics (Advisory)
+        MIN(CASE WHEN meeting_type = '01 Individual review' AND agent_type_2 IN ('WA', 'WM', 'WM HNW', 'WM HNW PB')
+            THEN appointment_date END) AS FIRST_ADV_IND_RV,
+        MAX(CASE WHEN meeting_type = '01 Individual review' AND agent_type_2 IN ('WA', 'WM', 'WM HNW', 'WM HNW PB')
+            THEN appointment_date END) AS LAST_ADV_IND_RV,
+        COUNT(CASE WHEN meeting_type = '01 Individual review' AND agent_type_2 IN ('WA', 'WM', 'WM HNW', 'WM HNW PB')
+            THEN 1 END) AS NO_OF_ADV_IND_RV,
+        
+        -- Discovery Meeting Metrics
+        MIN(CASE WHEN meeting_type = '02 Discovery meeting' AND agent_type_2 IN ('WA', 'WM', 'WM HNW', 'WM HNW PB')
+            THEN appointment_date END) AS FIRST_ADV_DIS,
+        MAX(CASE WHEN meeting_type = '02 Discovery meeting' AND agent_type_2 IN ('WA', 'WM', 'WM HNW', 'WM HNW PB')
+            THEN appointment_date END) AS LAST_ADV_DIS,
+        COUNT(CASE WHEN meeting_type = '02 Discovery meeting' AND agent_type_2 IN ('WA', 'WM', 'WM HNW', 'WM HNW PB')
+            THEN 1 END) AS NO_OF_ADV_DIS,
+        
+        -- Recommendation Meeting Metrics
+        MIN(CASE WHEN meeting_type = '03 Recommendation meeting' AND agent_type_2 IN ('WA', 'WM', 'WM HNW', 'WM HNW PB')
+            THEN appointment_date END) AS FIRST_adv_rec,
+        MAX(CASE WHEN meeting_type = '03 Recommendation meeting' AND agent_type_2 IN ('WA', 'WM', 'WM HNW', 'WM HNW PB')
+            THEN appointment_date END) AS LAST_adv_rec,
+        COUNT(CASE WHEN meeting_type = '03 Recommendation meeting' AND agent_type_2 IN ('WA', 'WM', 'WM HNW', 'WM HNW PB')
+            THEN 1 END) AS NO_OF_adv_rec,
+        
+        -- Annual Review Metrics
+        MIN(CASE WHEN meeting_type IN ('04 Annual review','05 Ongoing advice Annual Review') AND agent_type_2 IN ('WA', 'WM', 'WM HNW', 'WM HNW PB')
+            THEN appointment_date END) AS FIRST_ADV_ANR,
+        MAX(CASE WHEN meeting_type IN ('04 Annual review','05 Ongoing advice Annual Review') AND agent_type_2 IN ('WA', 'WM', 'WM HNW', 'WM HNW PB')
+            THEN appointment_date END) AS LAST_ADV_ANR,
+        COUNT(CASE WHEN meeting_type IN ('04 Annual review','05 Ongoing advice Annual Review') AND agent_type_2 IN ('WA', 'WM', 'WM HNW', 'WM HNW PB')
+            THEN 1 END) AS NO_OF_ADV_ANR
+    FROM All_Meetings_With_Journeys amwj
+    GROUP BY amwj.customer_number, amwj.journey_number
+),
+First_RM_Type_Journey AS (
+    SELECT DISTINCT
+        amwj.customer_number,
+        amwj.journey_number,
+        FIRST_VALUE(agent_type_2) OVER (
+            PARTITION BY customer_number, journey_number 
+            ORDER BY appointment_date ASC
+        ) AS FIRST_RM_TYPE
+    FROM All_Meetings_With_Journeys amwj
+    WHERE amwj.meeting_type = '01 Individual review'
+        AND amwj.agent_type_2 NOT IN ('WA','WM','WM HNW','WM HNW PB')
+),
+Final_RMP_Journey AS (
+    SELECT
+        ja.*,
+        frt.FIRST_RM_TYPE,
+        CONCAT('Journey_', CAST(ja.journey_number AS STRING)) as journey_id
+    FROM Journey_Aggregates ja
+    LEFT JOIN First_RM_Type_Journey frt
+        ON ja.CIN = frt.customer_number 
+        AND ja.journey_number = frt.journey_number
+),
+Fees_Journey AS (
+    SELECT
+        fd.CIN1 as matched_cin,
+        fd.invoice_date,
+        fd.case_no,
+        fd.agent_type_2,
+        fd.fee_description,
+        fd.wealth_wizards_case,
+        fd.central_Account,
+        fd.Lv1_4_code,
+        vrm.journey_number
+    FROM DS_UKP_WPB_DNA_F_HEALTH_PROD.FEES_Data_Import fd
+    JOIN Valid_Rec_Meetings_Journey vrm
+        ON SAFE_CAST(fd.CIN1 AS INT64) = vrm.customer_number
+        AND PARSE_DATE('%d/%m/%y', fd.invoice_date) BETWEEN vrm.rec_date AND DATE_ADD(vrm.rec_date, INTERVAL 3 MONTH)
+    UNION ALL
+    SELECT
+        fd.CIN2 as matched_cin,
+        fd.invoice_date,
+        fd.case_no,
+        fd.agent_type_2,
+        fd.fee_description,
+        fd.wealth_wizards_case,
+        fd.central_Account,
+        fd.Lv1_4_code,
+        vrm.journey_number
+    FROM DS_UKP_WPB_DNA_F_HEALTH_PROD.FEES_Data_Import fd
+    JOIN Valid_Rec_Meetings_Journey vrm
+        ON SAFE_CAST(fd.CIN2 AS INT64) = vrm.customer_number
+        AND PARSE_DATE('%d/%m/%y', fd.invoice_date) BETWEEN vrm.rec_date AND DATE_ADD(vrm.rec_date, INTERVAL 3 MONTH)
+),
+Fees_Final_Journey AS (
+    SELECT
+        matched_cin,
+        journey_number,
+        invoice_date,
+        fee_description,
+        fee_description2,
+        wealth_wizards_case,
+        central_Account,
+        Lv1_4_code,
+        case_no,
+        agent_type_2
+    FROM (
+        SELECT
+            matched_cin,
+            journey_number,
+            invoice_date,
+            fee_description,
+            fee_description2,
+            wealth_wizards_case,
+            central_Account,
+            Lv1_4_code,
+            case_no,
+            agent_type_2,
+            ROW_NUMBER() OVER (
+                PARTITION BY matched_cin, journey_number
+                ORDER BY case_no ASC
+            ) as rn
+        FROM Fees_Journey
+    )
+    WHERE rn = 1
+)
+SELECT 
+    frmp.FIRST_RM_TYPE,
+    frmp.CIN,
+    frmp.journey_number,
+    frmp.journey_id,
+    frmp.FIRST_IND_RV,
+    frmp.LAST_IND_RV,
+    frmp.NO_OF_IND_RV,
+    frmp.FIRST_ADV_IND_RV,
+    frmp.LAST_ADV_IND_RV,
+    frmp.NO_OF_ADV_IND_RV,
+    frmp.FIRST_ADV_DIS,
+    frmp.LAST_ADV_DIS,
+    frmp.NO_OF_ADV_DIS,
+    frmp.FIRST_adv_rec,
+    frmp.LAST_adv_rec,
+    frmp.NO_OF_adv_rec,
+    frmp.FIRST_ADV_ANR,
+    frmp.LAST_ADV_ANR,
+    frmp.NO_OF_ADV_ANR,
+    ff.invoice_date,
+    ff.case_no,
+    ff.agent_type_2 AS Fees_agent_type,
+    ff.fee_description,
+    ff.fee_description2,
+    ff.wealth_wizards_case,
+    ff.central_Account,
+    ff.Lv1_4_code
+FROM Final_RMP_Journey frmp
+LEFT JOIN Fees_Final_Journey ff
+    ON frmp.CIN = SAFE_CAST(ff.matched_cin AS INT64)
+    AND frmp.journey_number = ff.journey_number
+ORDER BY frmp.CIN, frmp.journey_number;
