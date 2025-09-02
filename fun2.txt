@@ -83,7 +83,7 @@ Journey_Numbers_Base AS (
         ) as journey_number
     FROM Journey_Breakpoints_Base
 ),
--- Get journey boundaries
+-- Get journey boundaries for existing journeys
 Journey_Boundaries AS (
     SELECT
         customer_number,
@@ -103,7 +103,7 @@ Discovery_Journey_Info AS (
     GROUP BY customer_number, journey_number
     HAVING MIN(CASE WHEN meeting_type = '02 Discovery meeting' THEN appointment_date END) IS NOT NULL
 ),
--- Priority assignment for recommendations
+-- Enhanced recommendation assignment with proper time-gap validation
 Recommendation_Assignment AS (
     SELECT
         rm.customer_number,
@@ -111,37 +111,45 @@ Recommendation_Assignment AS (
         rm.appointment_date,
         rm.rec_sequence,
         cfm.first_meeting_date,
-        -- Priority assignment logic    
+        -- Priority assignment logic with time-gap validation
         CASE 
             -- Rule 1: Within 9 months of first meeting -> Journey 1 (highest priority)
             WHEN rm.appointment_date BETWEEN cfm.first_meeting_date 
                 AND DATE_ADD(cfm.first_meeting_date, INTERVAL 9 MONTH) THEN 1
-            -- Rule 2: Find the latest journey that this recommendation can validly join
+            -- Rule 2: Find valid existing journey with proper time constraints
             ELSE (
-                SELECT MAX(jb.journey_number)
+                SELECT MAX(
+                    CASE 
+                        WHEN (
+                            -- Has discovery: within 6 months of discovery AND within 3 months of journey end
+                            (dji.discovery_date IS NOT NULL 
+                             AND rm.appointment_date BETWEEN dji.discovery_date 
+                             AND DATE_ADD(dji.discovery_date, INTERVAL 6 MONTH)
+                             AND DATE_DIFF(rm.appointment_date, jb.journey_end_date, DAY) <= 90)
+                            OR
+                            -- No discovery: within 3 months of journey start AND within 3 months of journey end
+                            (dji.discovery_date IS NULL 
+                             AND rm.appointment_date BETWEEN jb.journey_start_date 
+                             AND DATE_ADD(jb.journey_start_date, INTERVAL 3 MONTH)
+                             AND DATE_DIFF(rm.appointment_date, jb.journey_end_date, DAY) <= 90)
+                        ) THEN jb.journey_number
+                        ELSE NULL
+                    END
+                )
                 FROM Journey_Boundaries jb
                 LEFT JOIN Discovery_Journey_Info dji 
                     ON jb.customer_number = dji.customer_number 
                     AND jb.journey_number = dji.journey_number
                 WHERE jb.customer_number = rm.customer_number
                   AND rm.appointment_date >= jb.journey_start_date
-                  AND (
-                    -- Has discovery: within 6 months of discovery
-                    (dji.discovery_date IS NOT NULL 
-                     AND rm.appointment_date BETWEEN dji.discovery_date 
-                     AND DATE_ADD(dji.discovery_date, INTERVAL 6 MONTH))
-                    OR
-                    -- No discovery: within 3 months of journey start
-                    (dji.discovery_date IS NULL 
-                     AND rm.appointment_date BETWEEN jb.journey_start_date 
-                     AND DATE_ADD(jb.journey_start_date, INTERVAL 3 MONTH))
-                  )
             )
         END as assigned_journey_number,
-        -- Mark if this creates a new journey (when no valid existing journey found)
+        -- Mark if this creates a new journey
         CASE 
+            -- Within 9 months of first meeting - goes to Journey 1
             WHEN rm.appointment_date BETWEEN cfm.first_meeting_date 
                 AND DATE_ADD(cfm.first_meeting_date, INTERVAL 9 MONTH) THEN 0
+            -- Check if valid existing journey exists with time constraints
             WHEN NOT EXISTS (
                 SELECT 1
                 FROM Journey_Boundaries jb
@@ -151,15 +159,19 @@ Recommendation_Assignment AS (
                 WHERE jb.customer_number = rm.customer_number
                   AND rm.appointment_date >= jb.journey_start_date
                   AND (
+                    -- Has discovery: within 6 months of discovery AND within 3 months of journey end
                     (dji.discovery_date IS NOT NULL 
                      AND rm.appointment_date BETWEEN dji.discovery_date 
-                     AND DATE_ADD(dji.discovery_date, INTERVAL 6 MONTH))
+                     AND DATE_ADD(dji.discovery_date, INTERVAL 6 MONTH)
+                     AND DATE_DIFF(rm.appointment_date, jb.journey_end_date, DAY) <= 90)
                     OR
+                    -- No discovery: within 3 months of journey start AND within 3 months of journey end
                     (dji.discovery_date IS NULL 
                      AND rm.appointment_date BETWEEN jb.journey_start_date 
-                     AND DATE_ADD(jb.journey_start_date, INTERVAL 3 MONTH))
+                     AND DATE_ADD(jb.journey_start_date, INTERVAL 3 MONTH)
+                     AND DATE_DIFF(rm.appointment_date, jb.journey_end_date, DAY) <= 90)
                   )
-            ) THEN 1
+            ) THEN 1  -- Create new journey
             ELSE 0
         END as creates_new_journey
     FROM Recommendation_Meetings rm
